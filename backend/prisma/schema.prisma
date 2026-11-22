@@ -1,0 +1,482 @@
+// Reef Aquarium Smart LED Lighting Platform — unified multi-tenant data model.
+//
+// Hierarchy: Organization → Site → Tank → Device (light controller) → LED channels.
+// Home users get an auto-created PERSONAL organization, site and tank, so the
+// same model serves single-tank, multi-tank and enterprise customers.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum AccountType {
+  HOME
+  ENTERPRISE
+}
+
+enum OrganizationType {
+  PERSONAL
+  ENTERPRISE
+}
+
+enum RoleName {
+  OWNER
+  ADMIN
+  OPERATOR
+  VIEWER
+}
+
+enum TokenPurpose {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+enum ConnectionMode {
+  SIMULATED
+  BLE
+  WIFI
+  MQTT
+  CLOUD
+}
+
+enum DeviceStatus {
+  ONLINE
+  OFFLINE
+  PROVISIONING
+  ERROR
+}
+
+enum SyncStatus {
+  NEVER_SYNCED
+  PENDING
+  SYNCED
+  FAILED
+}
+
+enum CoralCategory {
+  SPS
+  LPS
+  SOFT
+  MIXED_REEF
+  FISH_ONLY
+  ANEMONE
+}
+
+enum ProfileVisibility {
+  PRIVATE // only the owning organization
+  SHARED  // visible to other users via cloud sharing
+  SYSTEM  // built-in preset
+}
+
+enum RampType {
+  SUNRISE
+  SUNSET
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum AlertStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+// ─────────────────────────── Identity ───────────────────────────
+
+model User {
+  id              String       @id @default(uuid())
+  email           String       @unique
+  passwordHash    String
+  displayName     String
+  accountType     AccountType  @default(HOME)
+  emailVerifiedAt DateTime?
+  mfaEnabled      Boolean      @default(false)
+  mfaSecretEnc    String? // AES-256-GCM encrypted TOTP secret
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  memberships   Membership[]
+  refreshTokens RefreshToken[]
+  emailTokens   EmailToken[]
+  passkeys      PasskeyCredential[]
+  challenges    AuthChallenge[]
+  auditLogs     AuditLog[]
+  sharedProfiles ProfileShare[]
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid())
+  userId     String
+  tokenHash  String    @unique // SHA-256 of the opaque token; raw token only lives in an httpOnly cookie
+  familyId   String // rotation family — reuse of a revoked token revokes the whole family
+  remember   Boolean   @default(false)
+  userAgent  String?
+  ip         String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+}
+
+model EmailToken {
+  id        String       @id @default(uuid())
+  userId    String
+  purpose   TokenPurpose
+  tokenHash String       @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime     @default(now())
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+}
+
+model PasskeyCredential {
+  id           String    @id @default(uuid())
+  userId       String
+  credentialId String    @unique // base64url
+  publicKey    Bytes
+  counter      BigInt    @default(0)
+  transports   String[]
+  deviceName   String?
+  createdAt    DateTime  @default(now())
+  lastUsedAt   DateTime?
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model AuthChallenge {
+  id        String   @id @default(uuid())
+  userId    String?
+  challenge String
+  kind      String // "passkey-register" | "passkey-login"
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────── Tenancy & RBAC ───────────────────────────
+
+model Organization {
+  id        String           @id @default(uuid())
+  name      String
+  type      OrganizationType @default(PERSONAL)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  memberships Membership[]
+  sites       Site[]
+  devices     Device[]
+  profiles    LightingProfile[]
+  auditLogs   AuditLog[]
+  alerts      Alert[]
+}
+
+/// "User Role" entity: a user's role inside one organization.
+model Membership {
+  id             String       @id @default(uuid())
+  userId         String
+  organizationId String
+  role           RoleName
+  isDefault      Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+}
+
+model Permission {
+  id          String           @id @default(uuid())
+  key         String           @unique // e.g. "device:apply"
+  description String
+  roles       RolePermission[]
+}
+
+model RolePermission {
+  role         RoleName
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([role, permissionId])
+}
+
+model Site {
+  id             String       @id @default(uuid())
+  organizationId String
+  name           String
+  timezone       String       @default("UTC")
+  address        String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tanks          Tank[]
+
+  @@index([organizationId])
+}
+
+model Tank {
+  id            String         @id @default(uuid())
+  siteId        String
+  name          String
+  volumeLiters  Int?
+  coralCategory CoralCategory  @default(MIXED_REEF)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  site          Site           @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  devices       Device[]
+  assignment    TankProfileAssignment?
+
+  @@index([siteId])
+}
+
+// ─────────────────────────── Devices ───────────────────────────
+
+model Device {
+  id              String         @id @default(uuid())
+  organizationId  String // denormalized for fast tenant checks
+  tankId          String?
+  hardwareId      String         @unique // MAC / serial reported by the controller
+  name            String
+  model           String         @default("Reef9 Controller")
+  firmwareVersion String?
+  connectionMode  ConnectionMode @default(SIMULATED)
+  isSimulated     Boolean        @default(true)
+  status          DeviceStatus   @default(PROVISIONING)
+  lastSeenAt      DateTime?
+  // Desired = what the cloud wants; reported = what the controller acknowledged.
+  desiredState    Json?
+  reportedState   Json?
+  syncStatus      SyncStatus     @default(NEVER_SYNCED)
+  lastSyncedAt    DateTime?
+  activeProfileVersionId String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  organization  Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tank          Tank?             @relation(fields: [tankId], references: [id], onDelete: SetNull)
+  channels      LedChannel[]
+  connections   DeviceConnection[]
+  telemetry     DeviceTelemetry[]
+  alerts        Alert[]
+  activeProfileVersion ProfileVersion? @relation(fields: [activeProfileVersionId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([tankId])
+}
+
+/// Physical channel on a controller. maxWattage is configurable per controller by admins.
+model LedChannel {
+  id         String @id @default(uuid())
+  deviceId   String
+  channelKey String // UV | VIOLET | ROYAL_BLUE | BLUE | GREEN | YELLOW | RED | WHITE | MOONLIGHT
+  position   Int // 1..9
+  label      String
+  maxWattage Float
+  device     Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, channelKey])
+}
+
+model DeviceConnection {
+  id         String         @id @default(uuid())
+  deviceId   String
+  mode       ConnectionMode
+  ssid       String? // never store Wi-Fi passwords
+  ipAddress  String?
+  succeeded  Boolean
+  message    String?
+  createdAt  DateTime       @default(now())
+  device     Device         @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, createdAt])
+}
+
+model DeviceTelemetry {
+  id            String   @id @default(uuid())
+  deviceId      String
+  recordedAt    DateTime @default(now())
+  intensities   Json
+  powerWatts    Float?
+  powerIsMeasured Boolean @default(false)
+  temperatureC  Float?
+  rssi          Int?
+  device        Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, recordedAt])
+}
+
+// ─────────────────────────── Lighting ───────────────────────────
+
+model LightingProfile {
+  id             String            @id @default(uuid())
+  organizationId String? // null for SYSTEM presets
+  name           String
+  description    String?
+  coralCategory  CoralCategory
+  visibility     ProfileVisibility @default(PRIVATE)
+  isBuiltIn      Boolean           @default(false)
+  presetKey      String?           @unique // "AB_PLUS", "SPS", ...
+  currentVersion Int               @default(1)
+  forkedFromId   String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  organization Organization?  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  versions     ProfileVersion[]
+  assignments  TankProfileAssignment[]
+  shares       ProfileShare[]
+
+  @@index([organizationId])
+}
+
+model ProfileVersion {
+  id              String   @id @default(uuid())
+  profileId       String
+  version         Int
+  rampUpMinutes   Int      @default(60)
+  rampDownMinutes Int      @default(60)
+  notes           String?
+  createdById     String?
+  createdAt       DateTime @default(now())
+
+  profile   LightingProfile        @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  channels  ChannelConfiguration[]
+  schedule  LightingSchedule?
+  devices   Device[]
+  pinnedBy  TankProfileAssignment[] @relation("PinnedVersion")
+
+  @@unique([profileId, version])
+}
+
+model ChannelConfiguration {
+  id               String         @id @default(uuid())
+  profileVersionId String
+  channelKey       String
+  intensity        Int // 0..100
+  profileVersion   ProfileVersion @relation(fields: [profileVersionId], references: [id], onDelete: Cascade)
+
+  @@unique([profileVersionId, channelKey])
+}
+
+/// Which profile a tank runs, which version is pinned, and per-tank overrides.
+model TankProfileAssignment {
+  id              String          @id @default(uuid())
+  tankId          String          @unique
+  profileId       String
+  pinnedVersionId String?
+  overrides       Json? // { "BLUE": 80 } — per-tank channel overrides
+  updatedAt       DateTime        @updatedAt
+  tank            Tank            @relation(fields: [tankId], references: [id], onDelete: Cascade)
+  profile         LightingProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  pinnedVersion   ProfileVersion? @relation("PinnedVersion", fields: [pinnedVersionId], references: [id], onDelete: SetNull)
+
+  @@index([profileId])
+}
+
+model ProfileShare {
+  id           String          @id @default(uuid())
+  profileId    String
+  sharedWithId String
+  createdAt    DateTime        @default(now())
+  profile      LightingProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  sharedWith   User            @relation(fields: [sharedWithId], references: [id], onDelete: Cascade)
+
+  @@unique([profileId, sharedWithId])
+}
+
+// ───────────────── Scheduler (Phase 5 foundation) ─────────────────
+
+model LightingSchedule {
+  id               String         @id @default(uuid())
+  profileVersionId String         @unique
+  timezone         String         @default("UTC")
+  enabled          Boolean        @default(true)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  profileVersion   ProfileVersion @relation(fields: [profileVersionId], references: [id], onDelete: Cascade)
+  channelWindows   ScheduleChannelWindow[]
+  ramps            ScheduleRamp[]
+  overrides        ScheduleOverride[]
+}
+
+/// Individual on/off time per channel (HH:mm, local to schedule timezone).
+model ScheduleChannelWindow {
+  id         String           @id @default(uuid())
+  scheduleId String
+  channelKey String
+  onTime     String
+  offTime    String
+  schedule   LightingSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  @@unique([scheduleId, channelKey])
+}
+
+model ScheduleRamp {
+  id              String           @id @default(uuid())
+  scheduleId      String
+  channelKey      String? // null = applies to all channels
+  type            RampType
+  startTime       String
+  durationMinutes Int
+  schedule        LightingSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+}
+
+model ScheduleOverride {
+  id          String           @id @default(uuid())
+  scheduleId  String
+  startsAt    DateTime
+  endsAt      DateTime
+  intensities Json
+  reason      String?
+  schedule    LightingSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────── Ops ───────────────────────────
+
+model AuditLog {
+  id             String        @id @default(uuid())
+  organizationId String?
+  userId         String?
+  action         String // e.g. "device.apply", "auth.login"
+  entityType     String?
+  entityId       String?
+  metadata       Json?
+  ip             String?
+  createdAt      DateTime      @default(now())
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  user           User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+}
+
+model Alert {
+  id             String        @id @default(uuid())
+  organizationId String
+  deviceId       String?
+  severity       AlertSeverity
+  status         AlertStatus   @default(OPEN)
+  code           String // e.g. "DEVICE_OFFLINE", "APPLY_FAILED"
+  message        String
+  createdAt      DateTime      @default(now())
+  resolvedAt     DateTime?
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  device         Device?       @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, status])
+}

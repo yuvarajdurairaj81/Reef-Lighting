@@ -1,0 +1,59 @@
+# Local development / single-host deployment stack.
+#   docker compose up --build
+# Frontend: http://localhost:8080   API: http://localhost:4000/api/v1   Docs: http://localhost:4000/api/docs
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: reef
+      POSTGRES_PASSWORD: reef
+      POSTGRES_DB: reef_lighting
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reef -d reef_lighting"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    # Catches all outgoing email (verification / reset links) in development.
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025" # web UI
+      - "1025:1025" # SMTP
+
+  mqtt:
+    # Broker reserved for Phase 5 (cloud <-> controller sync). Not required by Phases 1-4.
+    image: eclipse-mosquitto:2
+    profiles: ["phase5"]
+    ports:
+      - "1883:1883"
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql://reef:reef@db:5432/reef_lighting?schema=public
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+    ports:
+      - "4000:4000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
